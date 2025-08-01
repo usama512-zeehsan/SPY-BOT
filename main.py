@@ -1,49 +1,84 @@
-import datetime
-import time
+# main.py
 
-from utils.rsi import get_mock_rsi, has_opening_range_broken
-from utils.trade import place_mock_trade, is_loss_limit_hit, get_daily_pnl
+import pandas as pd
+from datetime import datetime
+from data.quote import get_intraday_data, get_daily_data
+from indicators.rsi import calculate_rsi
+from indicators.vwap import calculate_vwap
+from indicators.orb import calculate_orb_range
+from utils.config import SYMBOL
+from utils.notify import send_telegram_message
+from utils.stop_loss import enforce_daily_stop
+from utils.trade import place_real_trade
+from utils.logger import setup_logger
+from dotenv import load_dotenv
 
-def is_market_open():
-    now = datetime.datetime.now(pytz.timezone("US/Eastern"))
-    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    return market_open <= now <= market_close
-    # return True  # <-- Mock it for now 
+load_dotenv()
 
-def run_bot():
-    print("📈 Starting SPY 0DTE Bot\n")
+logger = setup_logger("main")
 
-    while True:
-        # For testing only
-        now = datetime.datetime.now().replace(hour=9, minute=30)
+def fetch_data(interval="5min"):
+    today = datetime.now().strftime('%Y-%m-%d')
 
+    if interval in ["1min", "5min", "15min"]:
+        return get_intraday_data(interval=interval, start=today, end=today)
+    elif interval in ["daily", "weekly", "monthly"]:
+        return get_daily_data(start=today, end=today)
+    else:
+        raise ValueError(f"Invalid interval: {interval}")
 
-        # Exit after market close (assumed 3:00 PM local time)
-        if now.hour >= 15:
-            print("✅ Market close reached. Stopping bot.")
-            break
+def evaluate_signals(df):
+    try:
+        orb_high, orb_low = calculate_orb_range(df)
+        df["rsi"] = calculate_rsi(df["close"])
+        df["vwap"] = calculate_vwap(df)
+        df["volume_avg"] = df["volume"].rolling(15).mean()
+        df["volume_x"] = df["volume"] / df["volume_avg"]
 
-        # Enforce daily loss limit
-        if is_loss_limit_hit():
-            print(f"❌ Daily loss limit hit: ${get_daily_pnl()}. Halting trading.")
-            break
+        latest = df.iloc[-1]
 
-        # 15-minute Opening Range Breakout logic
-        if has_opening_range_broken():
-            rsi = get_mock_rsi()
-            print(f"📊 RSI Value: {rsi}")
+        rsi = latest["rsi"]
+        volume_x = latest["volume_x"]
+        price = latest["close"]
+        vwap = latest["vwap"]
 
-            if 45 <= rsi <= 65:
-                pnl = place_mock_trade()
-                print(f"✅ Trade executed. PnL: ${pnl}, Daily PnL: ${get_daily_pnl()}")
-                # send_telegram_alert(f"Trade placed: PnL ${pnl}, Total: ${get_daily_pnl()}")
-            else:
-                print("⚠️ RSI outside target range. No trade executed.")
+        logger.info(f"Price: {price}, RSI: {rsi}, Vol x: {volume_x:.2f}, VWAP: {vwap}, ORB: ({orb_high}, {orb_low})")
+
+        # Check for Bull Put Spread signal
+        if price > orb_high and 50 <= rsi <= 65 and volume_x > 1.5 and price > vwap:
+            return "bull_put"
+        # Check for Bear Call Spread signal
+        elif price < orb_low and 35 <= rsi <= 50 and volume_x > 1.5 and price < vwap:
+            return "bear_call"
         else:
-            print("⏳ Waiting for Opening Range Breakout (15 mins after market open)...")
+            return None
+    except Exception as e:
+        logger.error(f"Signal evaluation failed: {e}")
+        return None
 
-        time.sleep(60)
+def main():
+    logger.info("Starting SPY 0DTE Bot...")
+
+    if enforce_daily_stop():
+        logger.warning("Stopped due to daily loss limit.")
+        return
+
+    df = fetch_data()
+    if df.empty or len(df) < 20:
+        logger.warning("Not enough data to evaluate.")
+        return
+
+    signal = evaluate_signals(df)
+    if signal:
+        message = f"✅ Signal Detected: *{signal.upper().replace('_', ' ')}* for {SYMBOL}"
+        logger.info(message)
+        send_telegram_message(message)
+
+        # Simulate order placement (replace with live trade logic if needed)
+        place_real_trade(signal, SYMBOL)
+    else:
+        logger.info("No valid signal yet.")
 
 if __name__ == "__main__":
-    run_bot()
+    main()
+
